@@ -46,7 +46,7 @@ async def get_last_1m_candle(session, symbol: str):
     data = await fetch_json(session, BINANCE_FAPI + KLINE_ENDPOINT, params=params)
     if not data:
         return None
-    k = data[-2] if len(data) >= 2 else data[-1]
+    k = data[-1]
     return {
         "open_time": int(k[0]),
         "open": float(k[1]),
