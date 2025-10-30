@@ -1,6 +1,8 @@
 import os
 import asyncio
 import time
+import re
+from datetime import datetime
 from typing import List
 import aiohttp
 from dotenv import load_dotenv
@@ -25,12 +27,37 @@ FIVE_MIN_INTERVAL = 240     # secunde între verificări 5m (4 min)
 last_alerted_1m = {}
 last_alerted_5m = {}
 
-# ============================
+# ========== FUNCTII UTILE ==========
 
-async def fetch_json(session, url, params=None):
-    async with session.get(url, params=params, timeout=20) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+def log(msg: str):
+    """Afișează mesaj cu oră în consolă."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+def escape_md(text: str) -> str:
+    """Curăță textul pentru Telegram MarkdownV2."""
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+
+def now_str() -> str:
+    """Returnează ora UTC pentru mesaje."""
+    return datetime.utcnow().strftime("%H:%M:%S UTC")
+
+def percent_change(o, c):
+    return 0.0 if o == 0 else (c - o) / o * 100.0
+
+# ========== REQUEST BINANCE ==========
+
+async def fetch_json(session, url, params=None, retries=2):
+    """Fetch JSON cu retry automat la erori Binance."""
+    for i in range(retries + 1):
+        try:
+            async with session.get(url, params=params, timeout=20) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            if i == retries:
+                log(f"Fetch error {url}: {e}")
+                return None
+            await asyncio.sleep(1)
 
 async def get_usdt_perpetual_symbols(session) -> List[str]:
     data = await fetch_json(session, BINANCE_FAPI + EXCHANGE_INFO)
@@ -44,7 +71,7 @@ async def get_last_candle(session, symbol: str, interval: str):
     data = await fetch_json(session, BINANCE_FAPI + KLINE_ENDPOINT, params=params)
     if not data:
         return None
-    k = data[-1]  # ✅ folosește lumânarea curentă pentru semnal instant
+    k = data[-1]  # ✅ Folosește lumânarea curentă (semnal instant)
     return {
         "open_time": int(k[0]),
         "open": float(k[1]),
@@ -53,20 +80,25 @@ async def get_last_candle(session, symbol: str, interval: str):
         "close": float(k[4]),
     }
 
+# ========== TELEGRAM ==========
+
 async def send_telegram(session, text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram config missing")
+        log("Telegram config missing")
         return
     url = f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "MarkdownV2"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": escape_md(text),
+        "parse_mode": "MarkdownV2",
+    }
     async with session.post(url, json=payload) as resp:
         if resp.status != 200:
-            print("Telegram error", resp.status, await resp.text())
+            txt = await resp.text()
+            log(f"Telegram error {resp.status}: {txt}")
 
-def percent_change(o, c):
-    return 0.0 if o == 0 else (c - o) / o * 100
+# ========== VERIFICARE 1 MINUT ==========
 
-# ===== Verificare 1 minut =====
 async def check_1m(session, symbol):
     try:
         c = await get_last_candle(session, symbol, "1m")
@@ -80,17 +112,19 @@ async def check_1m(session, symbol):
             dir = "UP" if ch > 0 else "DOWN"
             msg = (
                 f"⚡ *1m Spike* `{symbol}`\n"
+                f"🕒 {now_str()}\n"
                 f"Direction: *{dir}*\n"
                 f"Change: `{ch:.2f}%` in 1m\n"
                 f"Open: `{c['open']}` → Close: `{c['close']}`"
             )
             await send_telegram(session, msg)
             last_alerted_1m[symbol] = ot
-            print(f"[1m] {symbol}: {ch:.2f}%")
+            log(f"[1m] {symbol}: {ch:.2f}% {dir}")
     except Exception as e:
-        print(f"Error 1m {symbol}: {e}")
+        log(f"Error 1m {symbol}: {e}")
 
-# ===== Verificare 5 minute =====
+# ========== VERIFICARE 5 MINUTE ==========
+
 async def check_5m(session, symbol):
     try:
         c = await get_last_candle(session, symbol, "5m")
@@ -104,17 +138,24 @@ async def check_5m(session, symbol):
             dir = "UP" if ch > 0 else "DOWN"
             msg = (
                 f"🚀 *5m Spike* `{symbol}`\n"
+                f"🕒 {now_str()}\n"
                 f"Direction: *{dir}*\n"
                 f"Change: `{ch:.2f}%` in 5m\n"
                 f"Open: `{c['open']}` → Close: `{c['close']}`"
             )
             await send_telegram(session, msg)
             last_alerted_5m[symbol] = ot
-            print(f"[5m] {symbol}: {ch:.2f}%")
+            log(f"[5m] {symbol}: {ch:.2f}% {dir}")
     except Exception as e:
-        print(f"Error 5m {symbol}: {e}")
+        log(f"Error 5m {symbol}: {e}")
 
-# ===== Loopuri paralele =====
+# ========== LOOPURI PARALELE ==========
+
+async def run_check(session, s, func, sem):
+    async with sem:
+        await func(session, s)
+        await asyncio.sleep(0.05)  # ✅ anti-rate-limit Binance
+
 async def monitor_1m(symbols, session):
     sem = asyncio.Semaphore(CONCURRENCY)
     while True:
@@ -131,16 +172,13 @@ async def monitor_5m(symbols, session):
         await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.sleep(max(1, FIVE_MIN_INTERVAL - (time.time() - start)))
 
-async def run_check(session, s, func, sem):
-    async with sem:
-        await func(session, s)
+# ========== MAIN ==========
 
-# ===== MAIN =====
 async def main():
     connector = aiohttp.TCPConnector(limit_per_host=CONCURRENCY)
     async with aiohttp.ClientSession(connector=connector) as session:
         symbols = await get_usdt_perpetual_symbols(session)
-        print(f"✅ Monitoring {len(symbols)} USDT symbols (1m & 5m)...")
+        log(f"✅ Monitoring {len(symbols)} USDT symbols (1m & 5m)...")
         await send_telegram(session, f"🤖 Bot started: monitoring {len(symbols)} pairs (1m + 5m).")
         await asyncio.gather(
             monitor_1m(symbols, session),
@@ -151,4 +189,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Stopped by user")
+        log("Stopped by user")
