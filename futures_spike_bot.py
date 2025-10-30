@@ -14,8 +14,8 @@ TELEGRAM_API = "https://api.telegram.org"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
-PERCENT_THRESHOLD = float(os.getenv("PERCENT_THRESHOLD", "5.0"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
+PERCENT_THRESHOLD = float(os.getenv("PERCENT_THRESHOLD", "3.5"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "12"))
 SYMBOL_WHITELIST = os.getenv("SYMBOL_WHITELIST", "")
 
@@ -40,8 +40,9 @@ async def get_usdt_perpetual_symbols(session) -> List[str]:
         symbols = [s for s in symbols if s in allowed]
     return symbols
 
-async def get_last_5m_candle(session, symbol: str):
-    params = {"symbol": symbol, "interval": "5m", "limit": 2}
+async def get_last_1m_candle(session, symbol: str):
+    params = {"symbol": symbol, "interval": "1m", "limit": 2}
+
     data = await fetch_json(session, BINANCE_FAPI + KLINE_ENDPOINT, params=params)
     if not data:
         return None
@@ -72,7 +73,7 @@ def percent_change(open_p, close_p):
 
 async def check_symbol(session, symbol: str):
     try:
-        candle = await get_last_5m_candle(session, symbol)
+        candle = await get_last_1m_candle(session, symbol)
         if not candle:
             return
         ot = candle["open_time"]
@@ -85,7 +86,7 @@ async def check_symbol(session, symbol: str):
                 f"*Spike detected* `{symbol}`\n"
                 f"Direction: *{direction}*\n"
                 f"Open: `{candle['open']}` Close: `{candle['close']}`\n"
-                f"Change: `{ch:.2f}%` in 5m\n"
+                f"Change: `{ch:.2f}%` in 1m\n"
                 f"High/Low: `{candle['high']}` / `{candle['low']}`\n"
                 f"Volume: `{candle['volume']}`"
             )
