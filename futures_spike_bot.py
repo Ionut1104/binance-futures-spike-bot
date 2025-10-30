@@ -14,12 +14,18 @@ TELEGRAM_API = "https://api.telegram.org"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
-PERCENT_THRESHOLD = float(os.getenv("PERCENT_THRESHOLD", "3.5"))
-CONCURRENCY = int(os.getenv("CONCURRENCY", "12"))
-SYMBOL_WHITELIST = os.getenv("SYMBOL_WHITELIST", "")
+CONCURRENCY = int(os.getenv("CONCURRENCY", "15"))
 
-last_alerted_candle = {}
+# === Config personalizat ===
+ONE_MIN_THRESHOLD = 3.5     # % pentru 1 minut
+FIVE_MIN_THRESHOLD = 5.0    # % pentru 5 minute
+ONE_MIN_INTERVAL = 30       # secunde între verificări 1m
+FIVE_MIN_INTERVAL = 240     # secunde între verificări 5m (4 min)
+
+last_alerted_1m = {}
+last_alerted_5m = {}
+
+# ============================
 
 async def fetch_json(session, url, params=None):
     async with session.get(url, params=params, timeout=20) as resp:
@@ -28,33 +34,23 @@ async def fetch_json(session, url, params=None):
 
 async def get_usdt_perpetual_symbols(session) -> List[str]:
     data = await fetch_json(session, BINANCE_FAPI + EXCHANGE_INFO)
-    symbols = []
-    for s in data.get("symbols", []):
-        if s.get("status") != "TRADING":
-            continue
-        name = s.get("symbol")
-        if name and name.endswith("USDT"):
-            symbols.append(name)
-    if SYMBOL_WHITELIST:
-        allowed = {x.strip().upper() for x in SYMBOL_WHITELIST.split(",") if x.strip()}
-        symbols = [s for s in symbols if s in allowed]
-    return symbols
+    return [
+        s["symbol"] for s in data.get("symbols", [])
+        if s.get("status") == "TRADING" and s["symbol"].endswith("USDT")
+    ]
 
-async def get_last_1m_candle(session, symbol: str):
-    params = {"symbol": symbol, "interval": "1m", "limit": 2}
-
+async def get_last_candle(session, symbol: str, interval: str):
+    params = {"symbol": symbol, "interval": interval, "limit": 2}
     data = await fetch_json(session, BINANCE_FAPI + KLINE_ENDPOINT, params=params)
     if not data:
         return None
-    k = data[-1]
+    k = data[-1]  # ✅ folosește lumânarea curentă pentru semnal instant
     return {
         "open_time": int(k[0]),
         "open": float(k[1]),
         "high": float(k[2]),
         "low": float(k[3]),
         "close": float(k[4]),
-        "volume": float(k[5]),
-        "close_time": int(k[6]),
     }
 
 async def send_telegram(session, text: str):
@@ -65,60 +61,94 @@ async def send_telegram(session, text: str):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "MarkdownV2"}
     async with session.post(url, json=payload) as resp:
         if resp.status != 200:
-            txt = await resp.text()
-            print("Telegram error", resp.status, txt)
+            print("Telegram error", resp.status, await resp.text())
 
-def percent_change(open_p, close_p):
-    return 0.0 if open_p == 0 else (close_p - open_p) / open_p * 100.0
+def percent_change(o, c):
+    return 0.0 if o == 0 else (c - o) / o * 100
 
-async def check_symbol(session, symbol: str):
+# ===== Verificare 1 minut =====
+async def check_1m(session, symbol):
     try:
-        candle = await get_last_1m_candle(session, symbol)
-        if not candle:
+        c = await get_last_candle(session, symbol, "1m")
+        if not c:
             return
-        ot = candle["open_time"]
-        if last_alerted_candle.get(symbol) == ot:
+        ot = c["open_time"]
+        if last_alerted_1m.get(symbol) == ot:
             return
-        ch = percent_change(candle["open"], candle["close"])
-        if abs(ch) >= PERCENT_THRESHOLD:
-            direction = "UP" if ch > 0 else "DOWN"
+        ch = percent_change(c["open"], c["close"])
+        if abs(ch) >= ONE_MIN_THRESHOLD:
+            dir = "UP" if ch > 0 else "DOWN"
             msg = (
-                f"*Spike detected* `{symbol}`\n"
-                f"Direction: *{direction}*\n"
-                f"Open: `{candle['open']}` Close: `{candle['close']}`\n"
+                f"⚡ *1m Spike* `{symbol}`\n"
+                f"Direction: *{dir}*\n"
                 f"Change: `{ch:.2f}%` in 1m\n"
-                f"High/Low: `{candle['high']}` / `{candle['low']}`\n"
-                f"Volume: `{candle['volume']}`"
+                f"Open: `{c['open']}` → Close: `{c['close']}`"
             )
             await send_telegram(session, msg)
-            last_alerted_candle[symbol] = ot
-            print(f"Alert {symbol} {ch:.2f}%")
+            last_alerted_1m[symbol] = ot
+            print(f"[1m] {symbol}: {ch:.2f}%")
     except Exception as e:
-        print(f"Error checking {symbol}: {e}")
+        print(f"Error 1m {symbol}: {e}")
 
-async def main_loop():
+# ===== Verificare 5 minute =====
+async def check_5m(session, symbol):
+    try:
+        c = await get_last_candle(session, symbol, "5m")
+        if not c:
+            return
+        ot = c["open_time"]
+        if last_alerted_5m.get(symbol) == ot:
+            return
+        ch = percent_change(c["open"], c["close"])
+        if abs(ch) >= FIVE_MIN_THRESHOLD:
+            dir = "UP" if ch > 0 else "DOWN"
+            msg = (
+                f"🚀 *5m Spike* `{symbol}`\n"
+                f"Direction: *{dir}*\n"
+                f"Change: `{ch:.2f}%` in 5m\n"
+                f"Open: `{c['open']}` → Close: `{c['close']}`"
+            )
+            await send_telegram(session, msg)
+            last_alerted_5m[symbol] = ot
+            print(f"[5m] {symbol}: {ch:.2f}%")
+    except Exception as e:
+        print(f"Error 5m {symbol}: {e}")
+
+# ===== Loopuri paralele =====
+async def monitor_1m(symbols, session):
+    sem = asyncio.Semaphore(CONCURRENCY)
+    while True:
+        start = time.time()
+        tasks = [asyncio.create_task(run_check(session, s, check_1m, sem)) for s in symbols]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(max(1, ONE_MIN_INTERVAL - (time.time() - start)))
+
+async def monitor_5m(symbols, session):
+    sem = asyncio.Semaphore(CONCURRENCY)
+    while True:
+        start = time.time()
+        tasks = [asyncio.create_task(run_check(session, s, check_5m, sem)) for s in symbols]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(max(1, FIVE_MIN_INTERVAL - (time.time() - start)))
+
+async def run_check(session, s, func, sem):
+    async with sem:
+        await func(session, s)
+
+# ===== MAIN =====
+async def main():
     connector = aiohttp.TCPConnector(limit_per_host=CONCURRENCY)
     async with aiohttp.ClientSession(connector=connector) as session:
         symbols = await get_usdt_perpetual_symbols(session)
-        print(f"Found {len(symbols)} USDT symbols (sample): {symbols[:12]}")
-        if not symbols:
-            print("No symbols found. Exiting.")
-            return
-        sem = asyncio.Semaphore(CONCURRENCY)
-        while True:
-            start = time.time()
-            tasks = []
-            for sym in symbols:
-                async def run(s=sym):
-                    async with sem:
-                        await check_symbol(session, s)
-                tasks.append(asyncio.create_task(run()))
-            await asyncio.gather(*tasks, return_exceptions=True)
-            elapsed = time.time() - start
-            await asyncio.sleep(max(1, CHECK_INTERVAL - elapsed))
+        print(f"✅ Monitoring {len(symbols)} USDT symbols (1m & 5m)...")
+        await send_telegram(session, f"🤖 Bot started: monitoring {len(symbols)} pairs (1m + 5m).")
+        await asyncio.gather(
+            monitor_1m(symbols, session),
+            monitor_5m(symbols, session),
+        )
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main_loop())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("Stopped by user")
